@@ -17,9 +17,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 from sklearn.cluster import KMeans
 
-# Ensure to import DinoFeaturizer from the correct module
-from some_module import DinoFeaturizer  # Update with the correct module if needed
-
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 def get_class_labels(dataset_name):
