@@ -11,11 +11,14 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
+from pytorch_lightning import seed_everything
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.utilities.seed import seed_everything
-from torch.utils.data import DataLoader
 from pytorch_lightning.callbacks import ModelCheckpoint
+from torch.utils.data import DataLoader
 from sklearn.cluster import KMeans
+
+# Ensure to import DinoFeaturizer from the correct module
+from some_module import DinoFeaturizer  # Update with the correct module if needed
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -73,9 +76,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             raise ValueError("Unknown arch {}".format(cfg.arch))
 
         self.train_cluster_probe = ClusterLookup(dim, n_classes)
-
         self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
-        
         self.decoder = nn.Conv2d(dim, self.net.n_feats, (1, 1))
 
         self.cluster_metrics = UnsupervisedMetrics(
@@ -102,9 +103,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         self.save_hyperparameters()
 
     def forward(self, x):
-        # in lightning, forward defines the prediction/inference actions
         return self.net(x)[1]
-
 
     def training_step(self, batch, batch_idx):
         imgs, labels = batch
@@ -172,74 +171,18 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         return optimizer
 
     def on_epoch_end(self):
-        # Log the clustering results or any other metrics if needed
         self.log_cluster_centers()
 
     def log_cluster_centers(self):
-        # Method to log cluster centers (for monitoring purposes)
         kmeans = KMeans(n_clusters=self.n_classes, random_state=0)
         cluster_centers = kmeans.cluster_centers_
         for i, center in enumerate(cluster_centers):
             self.logger.experiment.add_scalar(f'cluster_center_{i}', center.mean(), self.current_epoch)
 
-
-    def training_step(self, batch, batch_idx):
-        img = batch["img"]
-        label = batch["label"]
-
-        # Forward pass
-        feats, _ = self.net(img)
-
-        # Clustering
-        # Get patches
-        patches = self.get_patches(img, patch_size=self.cfg.patch_size)
-
-        # Calculate average RGB values for each patch
-        avg_rgb_values = patches.mean(dim=(-2, -3))
-
-        # KMeans clustering
-        kmeans = KMeans(n_clusters=self.n_classes, random_state=0)
-        cluster_labels = kmeans.fit_predict(avg_rgb_values.view(avg_rgb_values.size(0), -1).cpu().numpy())
-
-        # Convert cluster_labels back to tensor
-        cluster_labels = torch.tensor(cluster_labels, device=self.device, dtype=torch.long)
-
-        # Calculate loss (e.g., CrossEntropyLoss with cluster_labels as targets)
-        loss = F.cross_entropy(feats.view(-1, self.n_classes), cluster_labels.view(-1))
-
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-
-        return loss
-
     def get_patches(self, img, patch_size):
-        # Method to extract patches from the image
         patches = img.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
         patches = patches.contiguous().view(img.size(0), img.size(1), -1, patch_size, patch_size)
         return patches
-
-
-    def validation_step(self, batch, batch_idx):
-        img = batch["img"]
-        label = batch["label"]
-        self.net.eval()
-
-        with torch.no_grad():
-            feats, _ = self.net(img)
-            patches = self.get_patches(img, patch_size=self.cfg.patch_size)
-            avg_rgb_values = patches.mean(dim=(-2, -3))
-            kmeans = KMeans(n_clusters=self.n_classes, random_state=0)
-            cluster_labels = kmeans.fit_predict(avg_rgb_values.view(avg_rgb_values.size(0), -1).cpu().numpy())
-            cluster_labels = torch.tensor(cluster_labels, device=self.device, dtype=torch.long)
-
-            loss = F.cross_entropy(feats.view(-1, self.n_classes), cluster_labels.view(-1))
-
-            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-
-        return loss
-
-    def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-        self.log('avg_val_loss', avg_loss)
 
     def test_step(self, batch, batch_idx):
         img = batch["img"]
@@ -260,11 +203,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         return loss
 
-    def configure_optimizers(self):
-        net_optim = torch.optim.Adam(self.net.parameters(), lr=self.cfg.lr)
-        return net_optim
-
-
 @hydra.main(config_path="configs", config_name="train_config.yml")
 def my_app(cfg: DictConfig) -> None:
     OmegaConf.set_struct(cfg, False)
@@ -284,9 +222,6 @@ def my_app(cfg: DictConfig) -> None:
 
     seed_everything(seed=0)
 
-    print(data_dir)
-    print(cfg.output_root)
-
     geometric_transforms = T.Compose([
         T.RandomHorizontalFlip(),
         T.RandomResizedCrop(size=cfg.res, scale=(0.8, 1.0))
@@ -296,8 +231,6 @@ def my_app(cfg: DictConfig) -> None:
         T.RandomGrayscale(.2),
         T.RandomApply([T.GaussianBlur((5, 5))])
     ])
-
-    sys.stdout.flush()
 
     train_dataset = ContrastiveSegDataset(
         pytorch_data_dir=pytorch_data_dir,
@@ -315,10 +248,7 @@ def my_app(cfg: DictConfig) -> None:
         pos_labels=True
     )
 
-    if cfg.dataset_name == "voc":
-        val_loader_crop = None
-    else:
-        val_loader_crop = "center"
+    val_loader_crop = None if cfg.dataset_name == "voc" else "center"
 
     val_dataset = ContrastiveSegDataset(
         pytorch_data_dir=pytorch_data_dir,
@@ -333,11 +263,7 @@ def my_app(cfg: DictConfig) -> None:
 
     train_loader = DataLoader(train_dataset, cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
 
-    if cfg.submitting_to_aml:
-        val_batch_size = 16
-    else:
-        val_batch_size = cfg.batch_size
-
+    val_batch_size = 16 if cfg.submitting_to_aml else cfg.batch_size
     val_loader = DataLoader(val_dataset, val_batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
 
     model = LitUnsupervisedSegmenter(train_dataset.n_classes, cfg)
@@ -347,17 +273,10 @@ def my_app(cfg: DictConfig) -> None:
         default_hp_metric=False
     )
 
-    if cfg.submitting_to_aml:
-        gpu_args = dict(gpus=1, val_check_interval=250)
+    gpu_args = dict(gpus=1, val_check_interval=250) if cfg.submitting_to_aml else dict(gpus=-1, accelerator='ddp', val_check_interval=cfg.val_freq)
 
-        if gpu_args["val_check_interval"] > len(train_loader):
-            gpu_args.pop("val_check_interval")
-
-    else:
-        gpu_args = dict(gpus=-1, accelerator='ddp', val_check_interval=cfg.val_freq)
-
-        if gpu_args["val_check_interval"] > len(train_loader) // 4:
-            gpu_args.pop("val_check_interval")
+    if gpu_args["val_check_interval"] > len(train_loader):
+        gpu_args.pop("val_check_interval")
 
     trainer = Trainer(
         log_every_n_steps=cfg.scalar_log_freq,
@@ -376,9 +295,5 @@ def my_app(cfg: DictConfig) -> None:
     )
     trainer.fit(model, train_loader, val_loader)
 
-
 if __name__ == "__main__":
-    prep_args()
     my_app()
-
-
