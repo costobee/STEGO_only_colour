@@ -36,7 +36,7 @@ from data import *
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 def get_class_labels(dataset_name):
-    if (dataset_name.startswith("cityscapes")):
+    if dataset_name.startswith("cityscapes"):
         return [
             'road', 'sidewalk', 'parking', 'rail track', 'building',
             'wall', 'fence', 'guard rail', 'bridge', 'tunnel',
@@ -44,7 +44,7 @@ def get_class_labels(dataset_name):
             'terrain', 'sky', 'person', 'rider', 'car',
             'truck', 'bus', 'caravan', 'trailer', 'train',
             'motorcycle', 'bicycle']
-    elif (dataset_name == "cocostuff27"):
+    elif dataset_name == "cocostuff27":
         return [
             "electronic", "appliance", "food", "furniture", "indoor",
             "kitchen", "accessory", "animal", "outdoor", "person",
@@ -52,14 +52,14 @@ def get_class_labels(dataset_name):
             "furniture", "rawmaterial", "textile", "wall", "window",
             "building", "ground", "plant", "sky", "solid",
             "structural", "water"]
-    elif (dataset_name == "voc"):
+    elif dataset_name == "voc":
         return [
             'background',
             'aeroplane', 'bicycle', 'bird', 'boat', 'bottle',
             'bus', 'car', 'cat', 'chair', 'cow',
             'diningtable', 'dog', 'horse', 'motorbike', 'person',
             'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor']
-    elif (dataset_name == "potsdam"):
+    elif dataset_name == "potsdam":
         return [
             'roads and cars',
             'buildings and clutter',
@@ -85,7 +85,7 @@ def color_based_clustering(image, patch_size, n_clusters):
     avg_rgb = compute_avg_rgb(patches)
     kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
     return kmeans.labels_
-
+    
 class LitUnsupervisedSegmenter(pl.LightningModule):
     def _init_(self, n_classes, cfg):
         super()._init_()
@@ -147,18 +147,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
     def forward(self, x):
         return self.net(x)[1]
 
-    def adjust_codes_with_color_clusters(self, code, color_clusters):
-        # Assuming code is a tensor of shape (batch_size, channels, height, width)
-        # and color_clusters is a 1D numpy array of cluster labels
-        batch_size, channels, height, width = code.shape
-        color_clusters = torch.tensor(color_clusters, dtype=torch.long).to(code.device)
-        color_clusters = color_clusters.view(height // patch_size, width // patch_size)
-        color_clusters = color_clusters.repeat_interleave(patch_size, dim=0).repeat_interleave(patch_size, dim=1)
-        color_clusters = color_clusters.unsqueeze(0).unsqueeze(0).expand(batch_size, channels, -1, -1)
-
-        adjusted_code = code + color_clusters.float()
-        return adjusted_code
-
     def training_step(self, batch, batch_idx):
         # optimizers
         net_optim, linear_probe_optim, cluster_probe_optim = self.optimizers()
@@ -207,23 +195,18 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
         color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
 
-        # Adjust code with color clustering information
-        code = self.adjust_codes_with_color_clusters(code, color_clusters)
+        # Integrate color clusters into the segmentation pipeline
+        # Example integration: adjust code with color clustering information or use it in a custom loss function
+        # Placeholder: convert color_clusters to a tensor or use it to refine code
 
         if self.cfg.correspondence_weight > 0:
-            pos_intra_cd = torch.einsum("bchw,bchw->bhw", feats, feats_pos)
-            pos_intra_loss = self.contrastive_corr_loss_fn(pos_intra_cd, salience, ind)
-
-            pos_inter_cd = torch.einsum("bchw,bchw->bhw", feats, feats_pos)
-            pos_inter_loss = self.contrastive_corr_loss_fn(pos_inter_cd, salience_pos, ind)
-
-            neg_inter_cd = torch.einsum("bchw,bchw->bhw", feats, feats_pos)
-            neg_inter_loss = self.contrastive_corr_loss_fn(neg_inter_cd, None, ind)
+            pos_intra_loss, pos_intra_cd, pos_inter_loss, pos_inter_cd, neg_inter_loss, neg_inter_cd = self.contrastive_corr_loss_fn(
+                signal, signal_pos, salience, salience_pos, code, code_pos)
 
             if should_log_hist:
-                self.log_histogram("pos_intra_cd", pos_intra_cd, self.global_step)
-                self.log_histogram("pos_inter_cd", pos_inter_cd, self.global_step)
-                self.log_histogram("neg_inter_cd", neg_inter_cd, self.global_step)
+                self.logger.experiment.add_histogram("intra_cd", pos_intra_cd, self.global_step)
+                self.logger.experiment.add_histogram("inter_cd", pos_inter_cd, self.global_step)
+                self.logger.experiment.add_histogram("neg_inter_cd", neg_inter_cd, self.global_step)
 
             intra_loss = (pos_intra_loss + pos_inter_loss) / 2
             loss = self.cfg.intra_weight * intra_loss + self.cfg.neg_inter_weight * neg_inter_loss
@@ -275,9 +258,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         n_clusters = self.n_classes  # Or any other number of clusters
         img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
         color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
-
-        # Adjust code with color clustering information
-        code = self.adjust_codes_with_color_clusters(code, color_clusters)
 
         if self.cfg.use_true_labels:
             signal = one_hot_feats(label + 1, self.n_classes + 1)
@@ -338,9 +318,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         n_clusters = self.n_classes  # Or any other number of clusters
         img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
         color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
-
-        # Adjust code with color clustering information
-        code = self.adjust_codes_with_color_clusters(code, color_clusters)
 
         seg_loss, confidence = self.crf_loss_fn(
             feats, feats_aug, coord_aug, salience, self.current_epoch + 1, None)
