@@ -1,16 +1,42 @@
-import pytorch_lightning as pl
-import torch
-import torch.nn as nn
-from sklearn.cluster import KMeans
+# General imports
 import os
-from os.path import join
+import sys
+import random
+from datetime import datetime
+from pathlib import Path
+
+# Data manipulation and visualization
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import cv2
+from sklearn.cluster import KMeans
+import torchvision.transforms as T
+
+# PyTorch and PyTorch Lightning
 import torch
 import torch.nn.functional as F
-import random
-import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from torchmetrics.classification import MulticlassAccuracy
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.utilities.seed import seed_everything
+
+# Configuration and utilities
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+# Custom modules
+from utils import *
+from modules import *
+from data import *
+
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 def get_class_labels(dataset_name):
-    if dataset_name.startswith("cityscapes"):
+    if (dataset_name.startswith("cityscapes")):
         return [
             'road', 'sidewalk', 'parking', 'rail track', 'building',
             'wall', 'fence', 'guard rail', 'bridge', 'tunnel',
@@ -18,7 +44,7 @@ def get_class_labels(dataset_name):
             'terrain', 'sky', 'person', 'rider', 'car',
             'truck', 'bus', 'caravan', 'trailer', 'train',
             'motorcycle', 'bicycle']
-    elif dataset_name == "cocostuff27":
+    elif (dataset_name == "cocostuff27"):
         return [
             "electronic", "appliance", "food", "furniture", "indoor",
             "kitchen", "accessory", "animal", "outdoor", "person",
@@ -26,14 +52,14 @@ def get_class_labels(dataset_name):
             "furniture", "rawmaterial", "textile", "wall", "window",
             "building", "ground", "plant", "sky", "solid",
             "structural", "water"]
-    elif dataset_name == "voc":
+    elif (dataset_name == "voc"):
         return [
             'background',
             'aeroplane', 'bicycle', 'bird', 'boat', 'bottle',
             'bus', 'car', 'cat', 'chair', 'cow',
             'diningtable', 'dog', 'horse', 'motorbike', 'person',
             'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor']
-    elif dataset_name == "potsdam":
+    elif (dataset_name == "potsdam"):
         return [
             'roads and cars',
             'buildings and clutter',
@@ -60,33 +86,52 @@ def color_based_clustering(image, patch_size, n_clusters):
     kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
     return kmeans.labels_
 
-
-
 class LitUnsupervisedSegmenter(pl.LightningModule):
-    def __init__(self, n_classes, cfg):
-        super().__init__()
+    def _init_(self, n_classes, cfg):
+        super()._init_()
         self.cfg = cfg
         self.n_classes = n_classes
 
-        # Determine feature dimension
         if not cfg.continuous:
             dim = n_classes
         else:
             dim = cfg.dim
 
-        # Initialize the network model
         data_dir = join(cfg.output_root, "data")
-        # Example: Initialize a generic model if 'cfg.model_type' is not available
-        cut_model = load_model(cfg.model_type, data_dir).cuda()
-        self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
+        if cfg.arch == "feature-pyramid":
+            cut_model = load_model(cfg.model_type, data_dir).cuda()
+            self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
+        elif cfg.arch == "dino":
+            self.net = DinoFeaturizer(dim, cfg)
+        else:
+            raise ValueError("Unknown arch {}".format(cfg.arch))
 
-        # Initialize color-based cluster probe
+        # color-based cluster probe
         self.train_cluster_probe = ClusterLookup(dim, n_classes)
+
+        # Initializing cluster probes with an option for extra clusters if needed
         self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
-        
+        self.linear_probe = nn.Conv2d(dim, n_classes, (1, 1))
+
         self.decoder = nn.Conv2d(dim, self.net.n_feats, (1, 1))
-        self.cluster_metrics = UnsupervisedMetrics("test/cluster/", n_classes, cfg.extra_clusters, True)
-        self.test_cluster_metrics = UnsupervisedMetrics("final/cluster/", n_classes, cfg.extra_clusters, True)
+
+        self.cluster_metrics = UnsupervisedMetrics(
+            "test/cluster/", n_classes, cfg.extra_clusters, True)
+        self.linear_metrics = UnsupervisedMetrics(
+            "test/linear/", n_classes, 0, False)
+
+        self.test_cluster_metrics = UnsupervisedMetrics(
+            "final/cluster/", n_classes, cfg.extra_clusters, True)
+        self.test_linear_metrics = UnsupervisedMetrics(
+            "final/linear/", n_classes, 0, False)
+
+        self.linear_probe_loss_fn = torch.nn.CrossEntropyLoss()
+        self.crf_loss_fn = ContrastiveCRFLoss(
+            cfg.crf_samples, cfg.alpha, cfg.beta, cfg.gamma, cfg.w1, cfg.w2, cfg.shift)
+
+        self.contrastive_corr_loss_fn = ContrastiveCorrelationLoss(cfg)
+        for p in self.contrastive_corr_loss_fn.parameters():
+            p.requires_grad = False
 
         self.automatic_optimization = False
 
@@ -96,121 +141,225 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         else:
             self.label_cmap = create_pascal_label_colormap()
 
+        self.val_steps = 0
         self.save_hyperparameters()
-
 
     def forward(self, x):
         return self.net(x)[1]
 
+    def adjust_codes_with_color_clusters(self, code, color_clusters):
+        # Assuming code is a tensor of shape (batch_size, channels, height, width)
+        # and color_clusters is a 1D numpy array of cluster labels
+        batch_size, channels, height, width = code.shape
+        color_clusters = torch.tensor(color_clusters, dtype=torch.long).to(code.device)
+        color_clusters = color_clusters.view(height // patch_size, width // patch_size)
+        color_clusters = color_clusters.repeat_interleave(patch_size, dim=0).repeat_interleave(patch_size, dim=1)
+        color_clusters = color_clusters.unsqueeze(0).unsqueeze(0).expand(batch_size, channels, -1, -1)
+
+        adjusted_code = code + color_clusters.float()
+        return adjusted_code
+
     def training_step(self, batch, batch_idx):
-        # Optimizers
-        net_optim, cluster_probe_optim = self.optimizers()
+        # optimizers
+        net_optim, linear_probe_optim, cluster_probe_optim = self.optimizers()
         net_optim.zero_grad()
+        linear_probe_optim.zero_grad()
         cluster_probe_optim.zero_grad()
 
         with torch.no_grad():
+            ind = batch["ind"]
             img = batch["img"]
+            img_aug = batch["img_aug"]
+            coord_aug = batch["coord_aug"]
+            img_pos = batch["img_pos"]
             label = batch["label"]
+            label_pos = batch["label_pos"]
 
         # Obtaining features and codes from the network
         feats, code = self.net(img)
-        
+        if self.cfg.correspondence_weight > 0:
+            feats_pos, code_pos = self.net(img_pos)
+
+        # Preparing signals based on true labels or features
+        if self.cfg.use_true_labels:
+            signal = one_hot_feats(label + 1, self.n_classes + 1)
+            signal_pos = one_hot_feats(label_pos + 1, self.n_classes + 1)
+        else:
+            signal = feats
+            signal_pos = feats_pos
+
+        loss = 0
+        should_log_hist = (self.cfg.hist_freq is not None) and \
+                          (self.global_step % self.cfg.hist_freq == 0) and \
+                          (self.global_step > 0)
+
+        # Salience maps
+        if self.cfg.use_salience:
+            salience = batch["mask"].to(torch.float32).squeeze(1)
+            salience_pos = batch["mask_pos"].to(torch.float32).squeeze(1)
+        else:
+            salience = None
+            salience_pos = None
+
         # Color-based clustering
-        patch_size = 16
-        n_clusters = self.n_classes
+        patch_size = 170
+        n_clusters = self.n_classes  # Or any other number of clusters
         img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
         color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
 
-        # Integrate color clusters if needed
-        # Placeholder for using color_clusters
+        # Adjust code with color clustering information
+        code = self.adjust_codes_with_color_clusters(code, color_clusters)
 
-        cluster_loss, cluster_preds = self.cluster_probe(code, None)
-        loss = cluster_loss
-        self.log('loss/cluster', cluster_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('loss/total', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        if self.cfg.correspondence_weight > 0:
+            pos_intra_cd = torch.einsum("bchw,bchw->bhw", feats, feats_pos)
+            pos_intra_loss = self.contrastive_corr_loss_fn(pos_intra_cd, salience, ind)
 
-        self.manual_backward(loss)
-        net_optim.step()
+            pos_inter_cd = torch.einsum("bchw,bchw->bhw", feats, feats_pos)
+            pos_inter_loss = self.contrastive_corr_loss_fn(pos_inter_cd, salience_pos, ind)
+
+            neg_inter_cd = torch.einsum("bchw,bchw->bhw", feats, feats_pos)
+            neg_inter_loss = self.contrastive_corr_loss_fn(neg_inter_cd, None, ind)
+
+            if should_log_hist:
+                self.log_histogram("pos_intra_cd", pos_intra_cd, self.global_step)
+                self.log_histogram("pos_inter_cd", pos_inter_cd, self.global_step)
+                self.log_histogram("neg_inter_cd", neg_inter_cd, self.global_step)
+
+            intra_loss = (pos_intra_loss + pos_inter_loss) / 2
+            loss = self.cfg.intra_weight * intra_loss + self.cfg.neg_inter_weight * neg_inter_loss
+
+        feats_aug, code_aug = self.net(img_aug)
+        seg_loss, confidence = self.crf_loss_fn(
+            feats, feats_aug, coord_aug, salience, self.current_epoch + 1, None)
+
+        net_optim.backward(seg_loss + loss)
+
+        # Optimizing the cluster probe and the linear probe
+        cluster_probe_optim.zero_grad()
+        probe_feats = self.decoder(feats.detach())
+        probe_loss = self.train_cluster_probe(probe_feats, confidence, ind)
+        cluster_probe_optim.backward(probe_loss)
         cluster_probe_optim.step()
 
-        return loss
+        linear_probe_optim.zero_grad()
+        linear_probe_feats = self.linear_probe(feats.detach())
+        linear_loss = self.linear_probe_loss_fn(linear_probe_feats, label)
+        linear_probe_optim.backward(linear_loss)
+        linear_probe_optim.step()
+
+        # Logging metrics
+        log_dict = {
+            "train/loss": (seg_loss + loss).detach(),
+            "train/cluster_probe_loss": probe_loss.detach(),
+            "train/linear_probe_loss": linear_loss.detach()
+        }
+        self.log_dict(log_dict, on_step=True, on_epoch=False)
+        net_optim.step()
+        return (seg_loss + loss).detach()
 
     def validation_step(self, batch, batch_idx):
-        img = batch["img"]
-        label = batch["label"]
-        self.net.eval()
-
         with torch.no_grad():
-            feats, code = self.net(img)
-            code = F.interpolate(code, label.shape[-2:], mode='bilinear', align_corners=False)
+            ind = batch["ind"]
+            img = batch["img"]
+            img_aug = batch["img_aug"]
+            coord_aug = batch["coord_aug"]
+            img_pos = batch["img_pos"]
+            label = batch["label"]
+            label_pos = batch["label_pos"]
 
-            # Color-based clustering for validation
-            patch_size = 16
-            n_clusters = self.n_classes
-            img_rgb = img.permute(0, 2, 3, 1).cpu().numpy() 
-            color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters) 
+        feats, code = self.net(img)
+        feats_aug, code_aug = self.net(img_aug)
 
-            # Integrate color clusters if needed
-            # Placeholder for using color_clusters
+        # Color-based clustering
+        patch_size = 170
+        n_clusters = self.n_classes  # Or any other number of clusters
+        img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
+        color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
 
-            cluster_loss, cluster_preds = self.cluster_probe(code, None)
-            cluster_preds = cluster_preds.argmax(1)
-            self.cluster_metrics.update(cluster_preds, label)
+        # Adjust code with color clustering information
+        code = self.adjust_codes_with_color_clusters(code, color_clusters)
 
-            return {
-                'img': img[:self.cfg.n_images].detach().cpu(),
-                'cluster_preds': cluster_preds[:self.cfg.n_images].detach().cpu(),
-                'label': label[:self.cfg.n_images].detach().cpu()
-            }
+        if self.cfg.use_true_labels:
+            signal = one_hot_feats(label + 1, self.n_classes + 1)
+            signal_pos = one_hot_feats(label_pos + 1, self.n_classes + 1)
+        else:
+            signal = feats
+            signal_pos = feats_pos
 
-    def validation_epoch_end(self, outputs) -> None:
-        super().validation_epoch_end(outputs)
+        if self.cfg.use_salience:
+            salience = batch["mask"].to(torch.float32).squeeze(1)
+            salience_pos = batch["mask_pos"].to(torch.float32).squeeze(1)
+        else:
+            salience = None
+            salience_pos = None
+
+        seg_loss, confidence = self.crf_loss_fn(
+            feats, feats_aug, coord_aug, salience, self.current_epoch + 1, None)
+
+        linear_probe_feats = self.linear_probe(feats)
+        linear_loss = self.linear_probe_loss_fn(linear_probe_feats, label)
+
+        log_dict = {
+            "val/seg_loss": seg_loss.detach(),
+            "val/linear_probe_loss": linear_loss.detach()
+        }
+        self.log_dict(log_dict, on_step=False, on_epoch=True)
+        return (seg_loss + linear_loss).detach()
+
+    def test_step(self, batch, batch_idx):
         with torch.no_grad():
-            tb_metrics = {
-                **self.cluster_metrics.compute(),
-            }
+            ind = batch["ind"]
+            img = batch["img"]
+            img_aug = batch["img_aug"]
+            coord_aug = batch["coord_aug"]
+            img_pos = batch["img_pos"]
+            label = batch["label"]
+            label_pos = batch["label_pos"]
 
-            if self.trainer.is_global_zero and not self.cfg.submitting_to_aml:
-                # Select a random output for visualization
-                output_num = random.randint(0, len(outputs) - 1)
-                output = {k: v.detach().cpu() for k, v in outputs[output_num].items()}
+        feats, code = self.net(img)
+        feats_aug, code_aug = self.net(img_aug)
 
-                fig, ax = plt.subplots(3, self.cfg.n_images, figsize=(self.cfg.n_images * 3, 3 * 3))
-                for i in range(self.cfg.n_images):
-                    ax[0, i].imshow(prep_for_plot(output["img"][i]))
-                    ax[1, i].imshow(self.label_cmap[output["label"][i]])
-                    ax[2, i].imshow(self.label_cmap[self.cluster_metrics.map_clusters(output["cluster_preds"][i])])
-                ax[0, 0].set_ylabel("Image", fontsize=16)
-                ax[1, 0].set_ylabel("Label", fontsize=16)
-                ax[2, 0].set_ylabel("Cluster Probe", fontsize=16)
-                remove_axes(ax)
-                plt.tight_layout()
-                add_plot(self.logger.experiment, "plot_labels", self.global_step)
+        if self.cfg.use_true_labels:
+            signal = one_hot_feats(label + 1, self.n_classes + 1)
+            signal_pos = one_hot_feats(label_pos + 1, self.n_classes + 1)
+        else:
+            signal = feats
+            signal_pos = feats_pos
+
+        if self.cfg.use_salience:
+            salience = batch["mask"].to(torch.float32).squeeze(1)
+            salience_pos = batch["mask_pos"].to(torch.float32).squeeze(1)
+        else:
+            salience = None
+            salience_pos = None
+
+        # Color-based clustering
+        patch_size = 170
+        n_clusters = self.n_classes  # Or any other number of clusters
+        img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
+        color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
+
+        # Adjust code with color clustering information
+        code = self.adjust_codes_with_color_clusters(code, color_clusters)
+
+        seg_loss, confidence = self.crf_loss_fn(
+            feats, feats_aug, coord_aug, salience, self.current_epoch + 1, None)
+
+        linear_probe_feats = self.linear_probe(feats)
+        linear_loss = self.linear_probe_loss_fn(linear_probe_feats, label)
+
+        log_dict = {
+            "test/seg_loss": seg_loss.detach(),
+            "test/linear_probe_loss": linear_loss.detach()
+        }
+        self.log_dict(log_dict, on_step=False, on_epoch=True)
+        return (seg_loss + linear_loss).detach()
 
     def configure_optimizers(self):
-        main_params = list(self.net.parameters())
-
-        if self.cfg.rec_weight > 0:
-            main_params.extend(self.decoder.parameters())
-
-        # Main optimizer for network parameters
-        net_optim = torch.optim.Adam(main_params, lr=self.cfg.lr)
-
-        # Separate optimizer for cluster probe
-        cluster_probe_optim = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
-
-        return [net_optim], [cluster_probe_optim]
-import os
-from datetime import datetime
-import hydra
-from omegaconf import DictConfig, OmegaConf
-import torchvision.transforms as T
-from torch.utils.data import DataLoader
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
-
-
+        net_optim = torch.optim.Adam(self.net.parameters(), lr=self.cfg.lr)
+        linear_probe_optim = torch.optim.Adam(self.linear_probe.parameters(), lr=self.cfg.lr)
+        cluster_probe_optim = torch.optim.Adam(self.cluster_probe.parameters(), lr=self.cfg.lr)
+        return [net_optim, linear_probe_optim, cluster_probe_optim]
 @hydra.main(config_path="configs", config_name="train_config.yml")
 def my_app(cfg: DictConfig) -> None:
     OmegaConf.set_struct(cfg, False)
@@ -308,6 +457,7 @@ def my_app(cfg: DictConfig) -> None:
         **gpu_args
     )
     trainer.fit(model, train_loader, val_loader)
+
 
 if __name__ == "__main__":
     my_app()
