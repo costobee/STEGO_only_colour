@@ -1,40 +1,7 @@
-import os
-import sys
-import random
-from datetime import datetime
-from pathlib import Path
-
-# Data manipulation and visualization
-import numpy as np
-import seaborn as sns
-import matplotlib.pyplot as plt
-import cv2
-from sklearn.cluster import KMeans
-import torchvision.transforms as T
-
-# PyTorch and PyTorch Lightning
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchmetrics.classification import MulticlassAccuracy
 import pytorch_lightning as pl
-from pytorch_lightning import Trainer
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.utilities.seed import seed_everything
-
-# Configuration and utilities
-import hydra
-from omegaconf import DictConfig, OmegaConf
-
-# Custom modules
-from utils import *
-from modules import *
-from data import *
-
-
-
-torch.multiprocessing.set_sharing_strategy('file_system')
+import torch
+import torch.nn as nn
+from sklearn.cluster import KMeans
 
 def get_class_labels(dataset_name):
     if dataset_name.startswith("cityscapes"):
@@ -98,10 +65,14 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         else:
             dim = cfg.dim
 
+        # Initialize model for color-based clustering
         data_dir = join(cfg.output_root, "data")
         if cfg.arch == "feature-pyramid":
             cut_model = load_model(cfg.model_type, data_dir).cuda()
             self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
+        else:
+            # Remove this line or update to handle color-based clustering without DINO
+            raise ValueError("Unknown arch {}".format(cfg.arch))
 
         # Color-based cluster probe
         self.train_cluster_probe = ClusterLookup(dim, n_classes)
@@ -111,10 +82,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         self.cluster_metrics = UnsupervisedMetrics("test/cluster/", n_classes, cfg.extra_clusters, True)
         self.test_cluster_metrics = UnsupervisedMetrics("final/cluster/", n_classes, cfg.extra_clusters, True)
 
-        self.contrastive_corr_loss_fn = ContrastiveCorrelationLoss(cfg)
-        for p in self.contrastive_corr_loss_fn.parameters():
-            p.requires_grad = False
-
+        # Remove DINO-specific loss function
         self.automatic_optimization = False
 
         # Color map for dataset visualization
@@ -124,6 +92,47 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.label_cmap = create_pascal_label_colormap()
 
         self.save_hyperparameters()
+import torch
+import torch.nn.functional as F
+import random
+import matplotlib.pyplot as plt
+
+class LitUnsupervisedSegmenter(pl.LightningModule):
+    def __init__(self, n_classes, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.n_classes = n_classes
+
+        if not cfg.continuous:
+            dim = n_classes
+        else:
+            dim = cfg.dim
+
+        # Initialize model for color-based clustering
+        data_dir = join(cfg.output_root, "data")
+        if cfg.arch == "feature-pyramid":
+            cut_model = load_model(cfg.model_type, data_dir).cuda()
+            self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
+        else:
+            raise ValueError("Unknown arch {}".format(cfg.arch))
+
+        # Color-based cluster probe
+        self.train_cluster_probe = ClusterLookup(dim, n_classes)
+        self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
+        
+        self.decoder = nn.Conv2d(dim, self.net.n_feats, (1, 1))
+        self.cluster_metrics = UnsupervisedMetrics("test/cluster/", n_classes, cfg.extra_clusters, True)
+        self.test_cluster_metrics = UnsupervisedMetrics("final/cluster/", n_classes, cfg.extra_clusters, True)
+
+        self.automatic_optimization = False
+
+        if self.cfg.dataset_name.startswith("cityscapes"):
+            self.label_cmap = create_cityscapes_colormap()
+        else:
+            self.label_cmap = create_pascal_label_colormap()
+
+        self.save_hyperparameters()
+
     def forward(self, x):
         return self.net(x)[1]
 
@@ -142,15 +151,13 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         
         # Color-based clustering
         patch_size = 16
-        n_clusters = self.n_classes  # Or any other number of clusters
+        n_clusters = self.n_classes
         img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
         color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
 
-        # Example of integrating color clusters: just a placeholder
-        # Adjust code with color clustering information or use it in a custom loss function
-        # Placeholder: convert color_clusters to a tensor or use it to refine code
+        # Integrate color clusters if needed
+        # Placeholder for using color_clusters
 
-        # Assuming you have some loss related to clusters
         cluster_loss, cluster_preds = self.cluster_probe(code, None)
         loss = cluster_loss
         self.log('loss/cluster', cluster_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -161,6 +168,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         cluster_probe_optim.step()
 
         return loss
+
     def validation_step(self, batch, batch_idx):
         img = batch["img"]
         label = batch["label"]
@@ -172,12 +180,12 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
             # Color-based clustering for validation
             patch_size = 16
-            n_clusters = self.n_classes  
+            n_clusters = self.n_classes
             img_rgb = img.permute(0, 2, 3, 1).cpu().numpy() 
             color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters) 
 
-            # Example integration: adjust code with color clustering information or use it in a custom evaluation
-            # Placeholder: convert color_clusters to a tensor or use it to refine code
+            # Integrate color clusters if needed
+            # Placeholder for using color_clusters
 
             cluster_loss, cluster_preds = self.cluster_probe(code, None)
             cluster_preds = cluster_preds.argmax(1)
@@ -212,6 +220,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
                 remove_axes(ax)
                 plt.tight_layout()
                 add_plot(self.logger.experiment, "plot_labels", self.global_step)
+
     def configure_optimizers(self):
         main_params = list(self.net.parameters())
 
@@ -225,6 +234,18 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         cluster_probe_optim = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
 
         return [net_optim], [cluster_probe_optim]
+import os
+from datetime import datetime
+import hydra
+from omegaconf import DictConfig, OmegaConf
+import torchvision.transforms as T
+from torch.utils.data import DataLoader
+from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
+from my_model import LitUnsupervisedSegmenter
+from my_dataset import ContrastiveSegDataset, get_transform
+
 @hydra.main(config_path="configs", config_name="train_config.yml")
 def my_app(cfg: DictConfig) -> None:
     OmegaConf.set_struct(cfg, False)
@@ -322,7 +343,6 @@ def my_app(cfg: DictConfig) -> None:
         **gpu_args
     )
     trainer.fit(model, train_loader, val_loader)
-
 
 if __name__ == "__main__":
     my_app()
