@@ -3,20 +3,18 @@ pytorch_data_dir: '/datadrive/pytorch-data/'
 experiment_name: "exp1"
 log_dir: "cleaning"
 
+# Plot parameters
 plot_correspondence: True
 plot_movie: True
-
 
 # Loader params
 num_workers: 24
 max_steps: 5000
-
 num_neighbors: 7
-
 batch_size: 16
 dataset_name: "cocostuff27"
 crop_type: ~
-crop_ratio: .5
+crop_ratio: 0.5
 res: 224
 loader_crop_type: "center"
 
@@ -36,16 +34,17 @@ dim: 70
 dropout: True
 zero_clamp: True
 
-
+# Learning rate and optimizer parameters
 lr: 5e-4
 pretrained_weights: ~
 use_salience: False
 stabalize: False
 stop_at_zero: True
 
+# Hydra configuration
 hydra:
   run:
     dir: "."
   output_subdir: ~
   #job_logging: "disabled"
-  #hydra_logging: "disabled"
+  #hydra_logging: "disabled
