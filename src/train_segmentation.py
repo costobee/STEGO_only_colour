@@ -87,7 +87,7 @@ def color_based_clustering(image, patch_size, n_clusters):
     return kmeans.labels_
     
 class LitUnsupervisedSegmenter(pl.LightningModule):
-    def _init_(self, n_classes, cfg):
+    def __init__(self, n_classes, cfg):
         super()._init_()
         self.cfg = cfg
         self.n_classes = n_classes
@@ -143,6 +143,9 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         self.val_steps = 0
         self.save_hyperparameters()
+    def load_from_checkpoint(cls, checkpoint_path, n_classes, cfg, **kwargs):
+        # Override the method to include n_classes and cfg
+        return super().load_from_checkpoint(checkpoint_path, n_classes=n_classes, cfg=cfg, **kwargs)
 
     def forward(self, x):
         return self.net(x)[1]
