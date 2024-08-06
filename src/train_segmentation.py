@@ -2,6 +2,8 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from sklearn.cluster import KMeans
+import os
+from os.path import join
 
 def get_class_labels(dataset_name):
     if dataset_name.startswith("cityscapes"):
