@@ -10,11 +10,13 @@ run_prediction: True
 dark_mode: True
 use_ddp: False
 
+# Model paths
 model_paths:
   - "../saved_models/cocostuff27_vit_base_5.ckpt"
-  #- "../saved_models/cityscapes_vit_base_1.ckpt"
-  #- "../saved_models/potsdam_test.ckpt"
+  # - "../saved_models/cityscapes_vit_base_1.ckpt"
+  # - "../saved_models/potsdam_test.ckpt"
 
+# Hydra configuration
 hydra:
   run:
     dir: "."
