@@ -1,21 +1,38 @@
 import os
-from os.path import join
+import sys
 import random
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as T
 from datetime import datetime
-import hydra
-from omegaconf import DictConfig, OmegaConf
+from pathlib import Path
+
+# Data manipulation and visualization
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import cv2
+from sklearn.cluster import KMeans
+import torchvision.transforms as T
+
+# PyTorch and PyTorch Lightning
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchmetrics.classification import MulticlassAccuracy
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
-from pytorch_lightning import seed_everything
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
-from torch.utils.data import DataLoader
-from sklearn.cluster import KMeans
+from pytorch_lightning.utilities.seed import seed_everything
+
+# Configuration and utilities
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
+# Custom modules
+from utils import *
+from modules import *
+from data import *
+
+
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -51,6 +68,24 @@ def get_class_labels(dataset_name):
     else:
         raise ValueError("Unknown Dataset {}".format(dataset_name))
 
+def get_patches(img, patch_size):
+    patches = []
+    h, w, _ = img.shape
+    for i in range(0, h, patch_size):
+        for j in range(0, w, patch_size):
+            patch = img[i:i+patch_size, j:j+patch_size]
+            patches.append(patch)
+    return patches
+
+def compute_avg_rgb(patches):
+    avg_rgb = [patch.mean(axis=(0, 1)) for patch in patches]
+    return np.array(avg_rgb)
+
+def color_based_clustering(image, patch_size, n_clusters):
+    patches = get_patches(image, patch_size)
+    avg_rgb = compute_avg_rgb(patches)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
+    return kmeans.labels_
 
 class LitUnsupervisedSegmenter(pl.LightningModule):
     def __init__(self, n_classes, cfg):
@@ -67,23 +102,16 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         if cfg.arch == "feature-pyramid":
             cut_model = load_model(cfg.model_type, data_dir).cuda()
             self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
-        elif cfg.arch == "dino":
-            self.net = DinoFeaturizer(dim, cfg)
         else:
             raise ValueError("Unknown arch {}".format(cfg.arch))
 
+        # Color-based cluster probe
         self.train_cluster_probe = ClusterLookup(dim, n_classes)
         self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
+        
         self.decoder = nn.Conv2d(dim, self.net.n_feats, (1, 1))
-
-        self.cluster_metrics = UnsupervisedMetrics(
-            "test/cluster/", n_classes, cfg.extra_clusters, True)
-
-        self.test_cluster_metrics = UnsupervisedMetrics(
-            "final/cluster/", n_classes, cfg.extra_clusters, True)
-
-        self.crf_loss_fn = ContrastiveCRFLoss(
-            cfg.crf_samples, cfg.alpha, cfg.beta, cfg.gamma, cfg.w1, cfg.w2, cfg.shift)
+        self.cluster_metrics = UnsupervisedMetrics("test/cluster/", n_classes, cfg.extra_clusters, True)
+        self.test_cluster_metrics = UnsupervisedMetrics("final/cluster/", n_classes, cfg.extra_clusters, True)
 
         self.contrastive_corr_loss_fn = ContrastiveCorrelationLoss(cfg)
         for p in self.contrastive_corr_loss_fn.parameters():
@@ -91,134 +119,141 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
 
         self.automatic_optimization = False
 
+        # Color map for dataset visualization
         if self.cfg.dataset_name.startswith("cityscapes"):
             self.label_cmap = create_cityscapes_colormap()
         else:
             self.label_cmap = create_pascal_label_colormap()
 
-        self.val_steps = 0
         self.save_hyperparameters()
-
     def forward(self, x):
         return self.net(x)[1]
 
     def training_step(self, batch, batch_idx):
-        imgs, labels = batch
-        feats, code1 = self.net(imgs)
-        feats = F.normalize(feats, dim=1)
+        # Optimizers
+        net_optim, cluster_probe_optim = self.optimizers()
+        net_optim.zero_grad()
+        cluster_probe_optim.zero_grad()
 
-        # Calculate RGB values of the patches
-        patch_size = self.cfg.patch_size
-        img_patches = imgs.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
-        avg_rgb_patches = img_patches.mean(dim=(-1, -2))
+        with torch.no_grad():
+            img = batch["img"]
+            label = batch["label"]
 
-        # Reshape to (N, num_patches, 3)
-        avg_rgb_patches = avg_rgb_patches.reshape(avg_rgb_patches.size(0), -1, 3).cpu().numpy()
-
-        # Cluster using K-Means
-        kmeans = KMeans(n_clusters=self.n_classes, random_state=0).fit(avg_rgb_patches.reshape(-1, 3))
-        cluster_assignments = kmeans.predict(avg_rgb_patches.reshape(-1, 3))
-        cluster_assignments = cluster_assignments.reshape(avg_rgb_patches.shape[0], avg_rgb_patches.shape[1])
-
-        # Assign cluster labels to features
-        cluster_labels = torch.tensor(cluster_assignments, device=feats.device).view(feats.size(0), 1, 1, feats.size(2), feats.size(3))
-        cluster_labels = cluster_labels.expand(feats.size())
-
-        # Loss calculation and backpropagation
-        optimizer = self.optimizers()
-        optimizer.zero_grad()
+        # Obtaining features and codes from the network
+        feats, code = self.net(img)
         
-        loss = F.cross_entropy(feats, cluster_labels)
+        # Color-based clustering
+        patch_size = 16
+        n_clusters = self.n_classes  # Or any other number of clusters
+        img_rgb = img.permute(0, 2, 3, 1).cpu().numpy()  # Convert to HWC format
+        color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters)  # Only for first image in batch
+
+        # Example of integrating color clusters: just a placeholder
+        # Adjust code with color clustering information or use it in a custom loss function
+        # Placeholder: convert color_clusters to a tensor or use it to refine code
+
+        # Assuming you have some loss related to clusters
+        cluster_loss, cluster_preds = self.cluster_probe(code, None)
+        loss = cluster_loss
+        self.log('loss/cluster', cluster_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('loss/total', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
         self.manual_backward(loss)
-        optimizer.step()
+        net_optim.step()
+        cluster_probe_optim.step()
 
-        self.log('train_loss', loss, on_epoch=True, prog_bar=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
-        imgs, labels = batch
-        feats, code1 = self.net(imgs)
-        feats = F.normalize(feats, dim=1)
-
-        # Calculate RGB values of the patches
-        patch_size = self.cfg.patch_size
-        img_patches = imgs.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
-        avg_rgb_patches = img_patches.mean(dim=(-1, -2))
-
-        # Reshape to (N, num_patches, 3)
-        avg_rgb_patches = avg_rgb_patches.reshape(avg_rgb_patches.size(0), -1, 3).cpu().numpy()
-
-        # Cluster using K-Means
-        kmeans = KMeans(n_clusters=self.n_classes, random_state=0).fit(avg_rgb_patches.reshape(-1, 3))
-        cluster_assignments = kmeans.predict(avg_rgb_patches.reshape(-1, 3))
-        cluster_assignments = cluster_assignments.reshape(avg_rgb_patches.shape[0], avg_rgb_patches.shape[1])
-
-        # Assign cluster labels to features
-        cluster_labels = torch.tensor(cluster_assignments, device=feats.device).view(feats.size(0), 1, 1, feats.size(2), feats.size(3))
-        cluster_labels = cluster_labels.expand(feats.size())
-
-        # Validation loss calculation
-        loss = F.cross_entropy(feats, cluster_labels)
-
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
-
-    def on_epoch_end(self):
-        self.log_cluster_centers()
-
-    def log_cluster_centers(self):
-        kmeans = KMeans(n_clusters=self.n_classes, random_state=0)
-        cluster_centers = kmeans.cluster_centers_
-        for i, center in enumerate(cluster_centers):
-            self.logger.experiment.add_scalar(f'cluster_center_{i}', center.mean(), self.current_epoch)
-
-    def get_patches(self, img, patch_size):
-        patches = img.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
-        patches = patches.contiguous().view(img.size(0), img.size(1), -1, patch_size, patch_size)
-        return patches
-
-    def test_step(self, batch, batch_idx):
+      def validation_step(self, batch, batch_idx):
         img = batch["img"]
         label = batch["label"]
         self.net.eval()
 
         with torch.no_grad():
-            feats, _ = self.net(img)
-            patches = self.get_patches(img, patch_size=self.cfg.patch_size)
-            avg_rgb_values = patches.mean(dim=(-2, -3))
-            kmeans = KMeans(n_clusters=self.n_classes, random_state=0)
-            cluster_labels = kmeans.fit_predict(avg_rgb_values.view(avg_rgb_values.size(0), -1).cpu().numpy())
-            cluster_labels = torch.tensor(cluster_labels, device=self.device, dtype=torch.long)
+            feats, code = self.net(img)
+            code = F.interpolate(code, label.shape[-2:], mode='bilinear', align_corners=False)
 
-            loss = F.cross_entropy(feats.view(-1, self.n_classes), cluster_labels.view(-1))
+            # Color-based clustering for validation
+            patch_size = 16
+            n_clusters = self.n_classes  
+            img_rgb = img.permute(0, 2, 3, 1).cpu().numpy() 
+            color_clusters = color_based_clustering(img_rgb[0], patch_size, n_clusters) 
 
-            self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            # Example integration: adjust code with color clustering information or use it in a custom evaluation
+            # Placeholder: convert color_clusters to a tensor or use it to refine code
 
-        return loss
+            cluster_loss, cluster_preds = self.cluster_probe(code, None)
+            cluster_preds = cluster_preds.argmax(1)
+            self.cluster_metrics.update(cluster_preds, label)
 
+            return {
+                'img': img[:self.cfg.n_images].detach().cpu(),
+                'cluster_preds': cluster_preds[:self.cfg.n_images].detach().cpu(),
+                'label': label[:self.cfg.n_images].detach().cpu()
+            }
+
+    def validation_epoch_end(self, outputs) -> None:
+        super().validation_epoch_end(outputs)
+        with torch.no_grad():
+            tb_metrics = {
+                **self.cluster_metrics.compute(),
+            }
+
+            if self.trainer.is_global_zero and not self.cfg.submitting_to_aml:
+                # Select a random output for visualization
+                output_num = random.randint(0, len(outputs) - 1)
+                output = {k: v.detach().cpu() for k, v in outputs[output_num].items()}
+
+                fig, ax = plt.subplots(3, self.cfg.n_images, figsize=(self.cfg.n_images * 3, 3 * 3))
+                for i in range(self.cfg.n_images):
+                    ax[0, i].imshow(prep_for_plot(output["img"][i]))
+                    ax[1, i].imshow(self.label_cmap[output["label"][i]])
+                    ax[2, i].imshow(self.label_cmap[self.cluster_metrics.map_clusters(output["cluster_preds"][i])])
+                ax[0, 0].set_ylabel("Image", fontsize=16)
+                ax[1, 0].set_ylabel("Label", fontsize=16)
+                ax[2, 0].set_ylabel("Cluster Probe", fontsize=16)
+                remove_axes(ax)
+                plt.tight_layout()
+                add_plot(self.logger.experiment, "plot_labels", self.global_step)
+    def configure_optimizers(self):
+        main_params = list(self.net.parameters())
+
+        if self.cfg.rec_weight > 0:
+            main_params.extend(self.decoder.parameters())
+
+        # Main optimizer for network parameters
+        net_optim = torch.optim.Adam(main_params, lr=self.cfg.lr)
+
+        # Separate optimizer for cluster probe
+        cluster_probe_optim = torch.optim.Adam(list(self.cluster_probe.parameters()), lr=5e-3)
+
+        return [net_optim], [cluster_probe_optim]
 @hydra.main(config_path="configs", config_name="train_config.yml")
 def my_app(cfg: DictConfig) -> None:
     OmegaConf.set_struct(cfg, False)
     print(OmegaConf.to_yaml(cfg))
+    
     pytorch_data_dir = cfg.pytorch_data_dir
-    data_dir = join(cfg.output_root, "data")
-    log_dir = join(cfg.output_root, "logs")
-    checkpoint_dir = join(cfg.output_root, "checkpoints")
+    data_dir = os.path.join(cfg.output_root, "data")
+    log_dir = os.path.join(cfg.output_root, "logs")
+    checkpoint_dir = os.path.join(cfg.output_root, "checkpoints")
 
-    prefix = "{}/{}_{}".format(cfg.log_dir, cfg.dataset_name, cfg.experiment_name)
-    name = '{}_date_{}'.format(prefix, datetime.now().strftime('%b%d_%H-%M-%S'))
-    cfg.full_name = prefix
-
+    # Creating directories if they do not exist
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    prefix = f"{cfg.log_dir}/{cfg.dataset_name}_{cfg.experiment_name}"
+    name = f"{prefix}_date_{datetime.now().strftime('%b%d_%H-%M-%S')}"
+    cfg.full_name = prefix
+
+    # Seed everything for reproducibility
     seed_everything(seed=0)
 
+    print(f"Data directory: {data_dir}")
+    print(f"Log directory: {log_dir}")
+
+    # Define data transformations
     geometric_transforms = T.Compose([
         T.RandomHorizontalFlip(),
         T.RandomResizedCrop(size=cfg.res, scale=(0.8, 1.0))
@@ -271,7 +306,6 @@ def my_app(cfg: DictConfig) -> None:
     )
 
     gpu_args = dict(gpus=1, val_check_interval=250) if cfg.submitting_to_aml else dict(gpus=-1, accelerator='ddp', val_check_interval=cfg.val_freq)
-
     if gpu_args["val_check_interval"] > len(train_loader):
         gpu_args.pop("val_check_interval")
 
@@ -284,13 +318,14 @@ def my_app(cfg: DictConfig) -> None:
                 dirpath=join(checkpoint_dir, name),
                 every_n_train_steps=400,
                 save_top_k=2,
-                monitor="val_loss",
-                mode="min",
+                monitor="test/cluster/mIoU",
+                mode="max",
             )
         ],
         **gpu_args
     )
     trainer.fit(model, train_loader, val_loader)
+
 
 if __name__ == "__main__":
     my_app()
