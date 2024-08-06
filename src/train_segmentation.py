@@ -163,8 +163,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         cluster_probe_optim.step()
 
         return loss
-
-      def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx):
         img = batch["img"]
         label = batch["label"]
         self.net.eval()
