@@ -102,8 +102,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         if cfg.arch == "feature-pyramid":
             cut_model = load_model(cfg.model_type, data_dir).cuda()
             self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
-        else:
-            raise ValueError("Unknown arch {}".format(cfg.arch))
 
         # Color-based cluster probe
         self.train_cluster_probe = ClusterLookup(dim, n_classes)
