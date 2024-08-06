@@ -243,8 +243,7 @@ from torch.utils.data import DataLoader
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
-from my_model import LitUnsupervisedSegmenter
-from my_dataset import ContrastiveSegDataset, get_transform
+
 
 @hydra.main(config_path="configs", config_name="train_config.yml")
 def my_app(cfg: DictConfig) -> None:
