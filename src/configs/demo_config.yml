@@ -7,6 +7,7 @@ batch_size: 8
 num_workers: 24
 use_ddp: False
 
+# Hydra configuration
 hydra:
   run:
     dir: "."
