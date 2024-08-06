@@ -4,6 +4,10 @@ import torch.nn as nn
 from sklearn.cluster import KMeans
 import os
 from os.path import join
+import torch
+import torch.nn.functional as F
+import random
+import matplotlib.pyplot as plt
 
 def get_class_labels(dataset_name):
     if dataset_name.startswith("cityscapes"):
@@ -56,27 +60,27 @@ def color_based_clustering(image, patch_size, n_clusters):
     kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(avg_rgb)
     return kmeans.labels_
 
+
+
 class LitUnsupervisedSegmenter(pl.LightningModule):
     def __init__(self, n_classes, cfg):
         super().__init__()
         self.cfg = cfg
         self.n_classes = n_classes
 
+        # Determine feature dimension
         if not cfg.continuous:
             dim = n_classes
         else:
             dim = cfg.dim
 
-        # Initialize model for color-based clustering
+        # Initialize the network model
         data_dir = join(cfg.output_root, "data")
-        if cfg.arch == "feature-pyramid":
-            cut_model = load_model(cfg.model_type, data_dir).cuda()
-            self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
-        else:
-            # Remove this line or update to handle color-based clustering without DINO
-            raise ValueError("Unknown arch {}".format(cfg.arch))
+        # Example: Initialize a generic model if 'cfg.model_type' is not available
+        cut_model = load_model(cfg.model_type, data_dir).cuda()
+        self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
 
-        # Color-based cluster probe
+        # Initialize color-based cluster probe
         self.train_cluster_probe = ClusterLookup(dim, n_classes)
         self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
         
@@ -84,7 +88,6 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
         self.cluster_metrics = UnsupervisedMetrics("test/cluster/", n_classes, cfg.extra_clusters, True)
         self.test_cluster_metrics = UnsupervisedMetrics("final/cluster/", n_classes, cfg.extra_clusters, True)
 
-        # Remove DINO-specific loss function
         self.automatic_optimization = False
 
         # Color map for dataset visualization
@@ -94,46 +97,7 @@ class LitUnsupervisedSegmenter(pl.LightningModule):
             self.label_cmap = create_pascal_label_colormap()
 
         self.save_hyperparameters()
-import torch
-import torch.nn.functional as F
-import random
-import matplotlib.pyplot as plt
 
-class LitUnsupervisedSegmenter(pl.LightningModule):
-    def __init__(self, n_classes, cfg):
-        super().__init__()
-        self.cfg = cfg
-        self.n_classes = n_classes
-
-        if not cfg.continuous:
-            dim = n_classes
-        else:
-            dim = cfg.dim
-
-        # Initialize model for color-based clustering
-        data_dir = join(cfg.output_root, "data")
-        if cfg.arch == "feature-pyramid":
-            cut_model = load_model(cfg.model_type, data_dir).cuda()
-            self.net = FeaturePyramidNet(cfg.granularity, cut_model, dim, cfg.continuous)
-        else:
-            raise ValueError("Unknown arch {}".format(cfg.arch))
-
-        # Color-based cluster probe
-        self.train_cluster_probe = ClusterLookup(dim, n_classes)
-        self.cluster_probe = ClusterLookup(dim, n_classes + cfg.extra_clusters)
-        
-        self.decoder = nn.Conv2d(dim, self.net.n_feats, (1, 1))
-        self.cluster_metrics = UnsupervisedMetrics("test/cluster/", n_classes, cfg.extra_clusters, True)
-        self.test_cluster_metrics = UnsupervisedMetrics("final/cluster/", n_classes, cfg.extra_clusters, True)
-
-        self.automatic_optimization = False
-
-        if self.cfg.dataset_name.startswith("cityscapes"):
-            self.label_cmap = create_cityscapes_colormap()
-        else:
-            self.label_cmap = create_pascal_label_colormap()
-
-        self.save_hyperparameters()
 
     def forward(self, x):
         return self.net(x)[1]
